@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+.npm
+
+# Environment variables — NEVER commit these
+.env
+.env.local
+.env.development
+.env.production
+
+# Build output
+/frontend/build
+/backend/dist
+/frontend-version1
+/backend/node_modules
+/frontend/node_modules
+
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini
+
+# Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage reports
+coverage/
+.nyc_output
+
+# Misc
+.cache/
+.parcel-cache/
