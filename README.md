@@ -1,360 +1,605 @@
 # RFQ Auction System
 
-A full-stack British Auction platform where buyers post freight/logistics RFQs (Request for Quotation) and carriers compete by submitting live bids. The auction automatically extends when bidding activity happens near the closing time — preventing last-second sniping and keeping competition fair.
-
-Built with **Express.js**, **PostgreSQL**, **Socket.io**, and **React**.
-
----
-
-## What does this actually do?
-
-Think of it like an eBay auction but flipped — instead of buyers competing to pay more, suppliers (carriers) compete to offer the *lowest* price for a shipment job.
-
-A buyer creates an RFQ with a closing time. Carriers submit bids with their freight charges. If a carrier places a bid in the last 10 minutes (configurable), the clock extends by 5 minutes. This keeps going until nobody bids, or the hard "forced close" deadline is hit — after which no extensions are possible.
-
-The entire rankings board and activity log update in real time via WebSockets, so every carrier watching the page sees instantly when they've been undercut.
+A full-stack **British Auction** platform for logistics RFQ (Request for Quotation).
+Buyers post freight routes, carriers compete by submitting progressively lower bids.
+The auction automatically extends when qualifying bids arrive near closing time.
 
 ---
 
-## Tech Stack
+## Table of Contents
 
-| Layer | Technology |
-|-------|-----------|
-| Backend API | Express.js (Node.js) |
-| Database | PostgreSQL |
-| Real-time | Socket.io |
-| Scheduler | node-cron |
-| Frontend | React (Create React App) |
-| Auth | JWT in httpOnly cookie + bcrypt |
+1. [Project Overview](#1-project-overview)
+2. [Tech Stack](#2-tech-stack)
+3. [File Structure](#3-file-structure)
+4. [Database Schema](#4-database-schema)
+5. [Auction Lifecycle](#5-auction-lifecycle)
+6. [British Auction Extension Rules](#6-british-auction--extension-rules)
+7. [API Reference](#7-api-reference)
+8. [Socket Events](#8-socket-events)
+9. [Setup — Backend](#9-setup--backend)
+10. [Setup — Frontend](#10-setup--frontend)
+11. [Environment Variables](#11-environment-variables)
+12. [Roles and Permissions](#12-roles--permissions)
 
 ---
 
-## Project Structure
+## 1. Project Overview
+
+### What is an RFQ?
+A **Request for Quotation** is a process where a buyer asks multiple suppliers
+(carriers) to submit price quotes for a freight or logistics service. Carriers
+compete on price and the buyer selects the best quote.
+
+### What is a British Auction?
+A British Auction in this system is a descending-price open auction where:
+
+- Carriers submit bids openly and can see current rankings in real time
+- Carriers can keep lowering their own price to beat competitors
+- If a qualifying bid arrives close to the auction end time, the auction
+  automatically extends to allow fair competition
+- A forced close time acts as a hard ceiling — the auction can never
+  extend past it no matter what
+
+### What this system does
+- Buyers create timed RFQ auctions with configurable British Auction rules
+- Carriers browse active auctions, submit bids, and watch live rankings
+- A background cron job manages auction state transitions automatically
+- All live changes (new bids, rank updates, time extensions, status changes)
+  are pushed to all connected clients via WebSockets
+
+---
+
+## 2. Tech Stack
+
+### Backend
+| Package | Version | Purpose |
+|---------|---------|---------|
+| Node.js | >= 18.x | Runtime |
+| Express | ^5.2.1 | HTTP server and routing |
+| pg | ^8.20.0 | PostgreSQL client |
+| socket.io | ^4.8.3 | Real-time WebSocket events |
+| jsonwebtoken | ^9.0.3 | JWT auth tokens |
+| bcryptjs | ^3.0.3 | Password hashing |
+| node-cron | ^4.2.1 | Scheduled auction state jobs |
+| dotenv | ^17.3.1 | Environment variable loading |
+| cors | ^2.8.6 | Cross-origin requests (open) |
+
+### Frontend
+| Package | Version | Purpose |
+|---------|---------|---------|
+| React | ^19.2.4 | UI framework |
+| react-router-dom | ^7.13.1 | Client-side routing |
+| axios | ^1.13.6 | HTTP requests |
+| socket.io-client | ^4.8.3 | Real-time updates |
+| date-fns | ^4.1.0 | Date formatting |
+
+### Database
+PostgreSQL (any version >= 13)
+
+---
+
+## 3. File Structure
 
 ```
 rfq-auction/
 │
+├── README.md
+│
 ├── backend/
-│   ├── src/
-│   │   ├── index.js                  ← Express app + Socket.io server entry point
-│   │   ├── db/
-│   │   │   └── index.js              ← PostgreSQL pool + auto-creates all tables on startup
-│   │   ├── middleware/
-│   │   │   └── auth.js               ← JWT verify middleware + requireRole() guard
-│   │   ├── routes/
-│   │   │   ├── auth.js               ← /api/auth — register, login, logout, me
-│   │   │   ├── rfqs.js               ← /api/rfqs — create, list, detail, activate
-│   │   │   └── bids.js               ← /api/bids — place, cancel, trigger extension logic
-│   │   ├── jobs/
-│   │   │   └── auctionCron.js        ← Runs every minute — closes expired auctions
-│   │   └── socket/
-│   │       └── index.js              ← Socket auth middleware + room join/leave
-│   ├── .env.example
-│   └── package.json
+│   ├── server.js                        # Entry point — Express + Socket.IO + cron bootstrap
+│   ├── package.json
+│   ├── .env                             # Environment variables
+│   │
+│   └── src/
+│       ├── config/
+│       │   ├── db.js                    # PostgreSQL connection pool (pg.Pool)
+│       │   └── schema.js                # Auto-creates all tables on first start
+│       │
+│       ├── middleware/
+│       │   └── auth.js                  # JWT verification + role guard (buyer/carrier)
+│       │
+│       ├── controllers/
+│       │   ├── authController.js        # signup, signin
+│       │   ├── auctionController.js     # createAuction, getBuyerAuctions,
+│       │   │                            #   getAllAuctions, getAuctionDetails
+│       │   └── bidController.js         # submitBid — core bid flow + socket emit
+│       │
+│       ├── services/
+│       │   └── auctionService.js        # All core business logic:
+│       │                                #   computeRanks    — best bid per carrier,
+│       │                                #                     correct tie-rank (L1,L1,L3)
+│       │                                #   checkAndExtend  — all 4 extension rules
+│       │                                #   activateAuction — draft to active
+│       │                                #   closeAuction    — active to closed/force_closed
+│       │                                #   addAuctionLog   — insert to auction_logs
+│       │
+│       ├── routes/
+│       │   ├── auth.js                  # POST /api/auth/signup  /signin
+│       │   ├── auctions.js              # GET/POST /api/auctions/...
+│       │   └── bids.js                  # POST /api/auctions/:id/bid
+│       │
+│       └── jobs/
+│           └── cronJobs.js              # Runs every 30 seconds:
+│                                        #   draft to active  (start_time reached)
+│                                        #   active to closed (current_end_time passed)
+│                                        #   active to force_closed (forced_end_time passed)
 │
 └── frontend/
+    ├── package.json
+    ├── .env                             # API and socket URLs
+    │
     ├── public/
-    │   └── index.html
-    ├── src/
-    │   ├── index.js                  ← CRA entry point
-    │   ├── App.jsx                   ← Routes + role-based auth guards
-    │   ├── index.css                 ← Global design system styles
-    │   ├── context/
-    │   │   └── AuthContext.jsx       ← Global user state, login/register/logout
-    │   ├── hooks/
-    │   │   └── useSocket.js          ← Singleton Socket.io connection + per-RFQ hook
-    │   ├── components/
-    │   │   ├── Navbar.jsx            ← Top nav with user info and logout
-    │   │   ├── Countdown.jsx         ← Live HH:MM:SS timer, pulses red under 5 min
-    │   │   └── BidModal.jsx          ← Bid form popup with live total calculation
-    │   └── pages/
-    │       ├── LoginPage.jsx
-    │       ├── RegisterPage.jsx
-    │       ├── BuyerDashboard.jsx    ← Create RFQs, view own auctions, activate
-    │       ├── CarrierDashboard.jsx  ← Browse all auctions with status filters
-    │       └── RFQDetailPage.jsx     ← Live bid rankings, activity log, bid controls
-    └── package.json
+    │   └── index.html                   # Loads Google Fonts: Syne, DM Mono, DM Sans
+    │
+    └── src/
+        ├── index.js                     # React DOM root
+        ├── index.css                    # Full design system (CSS variables, all components)
+        ├── App.js                       # Router + role-based protected route wrappers
+        │
+        ├── context/
+        │   └── AuthContext.js           # Global auth state: user, token, login(), logout()
+        │
+        ├── services/
+        │   ├── api.js                   # Axios instance with auto JWT header + auth/auction/bid APIs
+        │   └── socket.js                # Socket.IO singleton (one connection for the app)
+        │
+        ├── hooks/
+        │   └── useCountdown.js          # Live countdown timer hook, ticks every second
+        │
+        ├── utils/
+        │   └── format.js                # fmtDate, fmtDateTime, fmtCurrency (INR), getRankClass
+        │
+        ├── components/
+        │   └── Layout.js                # Sidebar shell: logo, nav links, user chip, logout
+        │
+        └── pages/
+            ├── SignIn.js                # Email + password sign in form
+            ├── SignUp.js                # Name, email, password, role picker (buyer/carrier)
+            │
+            ├── BuyerDashboard.js        # Buyer's auction list
+            │                            #   Stat cards: total / active / draft / closed
+            │                            #   "New Auction" modal with server-side validation
+            │                            #   Live socket updates to list
+            │
+            ├── AuctionDetails.js        # Buyer view of one auction:
+            │                            #   Auction info card + live countdown timer card
+            │                            #   Ranked bids table (all carriers, live via socket)
+            │                            #   Activity log (all events, live via socket)
+            │
+            ├── CarrierDashboard.js      # All active/closed/force_closed auctions
+            │                            #   Filter tabs: All / Active / Closed / Force Closed
+            │                            #   Live socket updates (new actives, closures)
+            │
+            └── CarrierAuctionDetail.js  # Carrier view of one auction:
+                                         #   Left panel: auction info, config, my current best bid
+                                         #   Right panel: countdown timer, ranked bids, activity log
+                                         #   Bid modal: charge fields, live running total in INR
+                                         #   "Place Bid" / "Bid Again" based on whether bid exists
 ```
 
 ---
 
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- PostgreSQL 14+
-- npm
-
-### 1. Clone and install
-
-```bash
-git clone <your-repo-url>
-cd rfq-auction
-```
-
-```bash
-# Backend
-cd backend
-npm install
-
-# Frontend (in a new terminal)
-cd frontend
-npm install
-```
-
-### 2. Set up the database
-
-```bash
-# Create the database (run this in psql or your DB client)
-CREATE DATABASE rfq_auction;
-```
-
-The tables are created automatically when the server starts — no migration files needed. On first boot, `db/index.js` runs `CREATE TABLE IF NOT EXISTS` for all four tables.
-
-### 3. Configure environment variables
-
-```bash
-cd backend
-cp .env.example .env
-```
-
-Open `.env` and fill in your values:
-
-```env
-DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/rfq_auction
-JWT_SECRET=pick_something_long_and_random_here
-PORT=3001
-CLIENT_URL=http://localhost:3000
-```
-
-> **JWT_SECRET** — don't leave it as the default. Use a random string of at least 32 characters.
-
-### 4. Start the servers
-
-```bash
-# Terminal 1 — backend
-cd backend
-npm run dev
-
-# Terminal 2 — frontend
-cd frontend
-npm start
-```
-
-Open [http://localhost:3000](http://localhost:3000) in your browser.
-
----
-
-## How to Use It
-
-### As a Buyer
-
-1. Register an account with role **Buyer**
-2. Log in — you'll land on the Buyer Dashboard
-3. Click **+ New RFQ** and fill in the form:
-   - Give the RFQ a name (e.g. "Delhi → Mumbai Shipment March 2024")
-   - Set a **Bid Start** time — when carriers can start bidding
-   - Set a **Bid Close** time — when bidding normally ends
-   - Set a **Forced Close** time — the absolute hard deadline (must be after Bid Close)
-   - Set a **Pickup Date** — when the actual service is needed
-   - Optionally adjust **Trigger Window** (default 10 min) and **Extension Time** (default 5 min)
-4. The RFQ is created as a **Draft**. Click **Activate** to open it for bidding, or wait — it auto-activates when the Bid Start time arrives.
-5. Click any RFQ to see live rankings, all carrier bids, and the full activity log.
-
-### As a Carrier
-
-1. Register an account with role **Carrier**
-2. Log in — you'll land on the Carrier Dashboard showing all available auctions
-3. Filter by status: All / Active / Closed / Draft
-4. Click any active auction to open the detail page
-5. Click **Place Bid** — fill in:
-   - Freight Charges
-   - Origin Charges
-   - Destination Charges
-   - Transit Time (days)
-   - Quote Validity date
-   - The total cost is calculated automatically
-6. Your rank (L1, L2, L3...) updates instantly on everyone's screen
-7. You can **Update Bid** to submit a lower price, or **Cancel Bid** to withdraw
-8. Watch the countdown timer — if it extends due to trigger window activity, the new time shows immediately
-
----
-
-## Auction Extension Logic
-
-This is the core mechanic. When a bid or cancellation happens, the system checks three conditions. If **any** of them is true and we're inside the trigger window, the auction extends.
-
-**Trigger window** = the last X minutes before closing (default: 10 minutes)
-
-| Condition | What triggers it |
-|-----------|-----------------|
-| **A** | Any new bid placed OR any bid cancelled during the trigger window |
-| **B** | Any carrier's rank position changed compared to before the action |
-| **C** | The L1 (lowest bidder) changed — a different carrier took the top spot |
-
-**Example:** Bid Close is 6:00 PM. Trigger Window is 10 minutes. Extension is 5 minutes.
-
-- A carrier bids at 5:55 PM → Condition A fires → Close extends to 6:05 PM
-- Another carrier undercuts them at 6:02 PM → Condition A + C fire → Close extends to 6:07 PM
-- Forced Close is 6:15 PM → if the next extension would push past 6:15, it gets capped at 6:15
-- Once 6:15 PM hits → auction is marked **force_closed**, no more extensions possible
-
-The extension cap is important — nobody can keep an auction alive indefinitely.
-
----
-
-## API Reference
-
-### Auth
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| POST | `/api/auth/register` | — | Create account. Body: `{ name, email, password, role }` |
-| POST | `/api/auth/login` | — | Login. Sets httpOnly JWT cookie. Body: `{ email, password }` |
-| POST | `/api/auth/logout` | — | Clears the cookie |
-| GET | `/api/auth/me` | cookie | Returns current user from cookie |
-
-### RFQs
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| POST | `/api/rfqs` | buyer | Create a new RFQ |
-| GET | `/api/rfqs` | any | Buyer: own RFQs. Carrier: all RFQs. Includes `lowest_bid` field. |
-| GET | `/api/rfqs/:id` | any | Full detail — ranked bids, logs, `myBid` for carriers |
-| PATCH | `/api/rfqs/:id/activate` | buyer | Manually activate a draft RFQ |
-
-### Bids
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| POST | `/api/bids/:rfqId` | carrier | Place or replace bid. Triggers extension check. |
-| DELETE | `/api/bids/:rfqId` | carrier | Cancel active bid. Triggers extension check. |
-
----
-
-## WebSocket Events
-
-The frontend maintains a single Socket.io connection. When a user opens an RFQ detail page, they join that auction's room (`rfq_{id}`). All events are scoped to that room — you only get updates for the RFQ you're currently viewing.
-
-### Client → Server
-
-| Event | Payload | When to send |
-|-------|---------|-------------|
-| `join_rfq` | `rfqId` | On RFQ detail page mount |
-| `leave_rfq` | `rfqId` | On RFQ detail page unmount |
-
-### Server → Client
-
-| Event | Payload | What happened |
-|-------|---------|--------------|
-| `bids_updated` | `{ bids[], logs[], newBid? }` | A bid was placed or cancelled |
-| `rfq_updated` | `{ rfq, reason }` | Auction end time was extended |
-| `auction_ended` | `{ status }` | Cron job closed the auction |
-
----
-
-## Database Schema
+## 4. Database Schema
 
 ### users
+
 ```sql
-id         SERIAL PRIMARY KEY
-name       VARCHAR(255) NOT NULL
-email      VARCHAR(255) UNIQUE NOT NULL
-password   VARCHAR(255) NOT NULL          -- bcrypt hash
-role       VARCHAR(20) CHECK (role IN ('buyer', 'carrier'))
-created_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE users (
+  id         SERIAL PRIMARY KEY,
+  name       VARCHAR(255)        NOT NULL,
+  email      VARCHAR(255) UNIQUE NOT NULL,
+  password   VARCHAR(255)        NOT NULL,   -- bcrypt hash, never stored plain
+  role       VARCHAR(20)         NOT NULL CHECK (role IN ('buyer', 'carrier')),
+  created_at TIMESTAMP           DEFAULT NOW()
+);
 ```
 
-### rfqs
+### auctions
+
 ```sql
-id               SERIAL PRIMARY KEY
-buyer_id         INTEGER REFERENCES users(id)
-name             VARCHAR(255) NOT NULL
-start_date       TIMESTAMP NOT NULL
-end_date         TIMESTAMP NOT NULL        -- extends during trigger window
-forced_end_date  TIMESTAMP NOT NULL        -- hard cap, never changes
-pickup_date      DATE NOT NULL
-trigger_window   INTEGER DEFAULT 10        -- minutes
-extension_time   INTEGER DEFAULT 5         -- minutes
-status           VARCHAR(20) DEFAULT 'draft'
-                 CHECK (status IN ('draft','active','closed','force_closed'))
-created_at       TIMESTAMP DEFAULT NOW()
+CREATE TABLE auctions (
+  id                  SERIAL PRIMARY KEY,
+  rfq_name            VARCHAR(255)  NOT NULL,
+  buyer_id            INTEGER       REFERENCES users(id) ON DELETE CASCADE,
+
+  -- Scheduled time bounds (stored as UTC)
+  start_time          TIMESTAMP     NOT NULL,   -- when cron activates the auction
+  end_time            TIMESTAMP     NOT NULL,   -- original scheduled end time
+  forced_end_time     TIMESTAMP     NOT NULL,   -- absolute hard ceiling, never exceeded
+  pickup_date         DATE          NOT NULL,   -- freight service/pickup date
+  current_end_time    TIMESTAMP     NOT NULL,   -- actual end (pushed forward by extensions)
+
+  -- British Auction configuration
+  trigger_window      INTEGER       NOT NULL DEFAULT 5,   -- X: monitor last X minutes
+  extension_duration  INTEGER       NOT NULL DEFAULT 5,   -- Y: extend by Y minutes
+
+  -- State
+  status              VARCHAR(20)   NOT NULL DEFAULT 'draft'
+                        CHECK (status IN ('draft', 'active', 'closed', 'force_closed')),
+  lowest_bid          NUMERIC(15,2),   -- cached for fast list display
+
+  created_at          TIMESTAMP     DEFAULT NOW(),
+  updated_at          TIMESTAMP     DEFAULT NOW()
+);
 ```
 
 ### bids
+
 ```sql
-id                   SERIAL PRIMARY KEY
-rfq_id               INTEGER REFERENCES rfqs(id)
-user_id              INTEGER REFERENCES users(id)
-freight_charges      NUMERIC(12,2) NOT NULL
-origin_charges       NUMERIC(12,2) NOT NULL
-destination_charges  NUMERIC(12,2) NOT NULL
-total_cost           NUMERIC(12,2) GENERATED ALWAYS AS
-                       (freight_charges + origin_charges + destination_charges) STORED
-transit_time         INTEGER NOT NULL      -- days
-validity_of_quote    DATE NOT NULL
-is_active            BOOLEAN DEFAULT true  -- false = replaced or cancelled
-created_at           TIMESTAMP DEFAULT NOW()
+CREATE TABLE bids (
+  id                   SERIAL PRIMARY KEY,
+  auction_id           INTEGER        REFERENCES auctions(id) ON DELETE CASCADE,
+  carrier_id           INTEGER        REFERENCES users(id)    ON DELETE CASCADE,
+  carrier_name         VARCHAR(255)   NOT NULL,
+
+  -- Charge breakdown (all amounts in INR)
+  freight_charges      NUMERIC(15,2)  NOT NULL DEFAULT 0,
+  origin_charges       NUMERIC(15,2)  NOT NULL DEFAULT 0,
+  destination_charges  NUMERIC(15,2)  NOT NULL DEFAULT 0,
+  total_amount         NUMERIC(15,2)  NOT NULL,  -- = freight + origin + destination
+
+  transit_time         VARCHAR(100)   NOT NULL,
+  quote_validity       DATE           NOT NULL,
+
+  created_at           TIMESTAMP      DEFAULT NOW()
+);
 ```
 
-> `total_cost` is a generated column — PostgreSQL computes it automatically. You never set it directly.
-> `is_active = false` means the bid was replaced (carrier updated their bid) or cancelled. Old bids are kept for history.
+One carrier can submit multiple bids on one auction.
+Rankings always use the carrier's single lowest bid
+(`DISTINCT ON (carrier_id) ORDER BY carrier_id, total_amount ASC`).
+Each new bid must have a total strictly less than the carrier's previous best.
 
-### logs
+### auction_logs
+
 ```sql
-id          SERIAL PRIMARY KEY
-rfq_id      INTEGER REFERENCES rfqs(id)
-action      VARCHAR(50) CHECK (action IN ('bid','bid_extension','status_change'))
-description TEXT NOT NULL
-created_at  TIMESTAMP DEFAULT NOW()
+CREATE TABLE auction_logs (
+  id          SERIAL PRIMARY KEY,
+  auction_id  INTEGER      REFERENCES auctions(id) ON DELETE CASCADE,
+  action      VARCHAR(100) NOT NULL,
+  description TEXT         NOT NULL,
+  created_at  TIMESTAMP    DEFAULT NOW()
+);
+```
+
+**All possible action values:**
+
+| Action | Triggered when |
+|--------|---------------|
+| `CREATED` | Auction saved as draft by buyer |
+| `ACTIVATED` | Cron promotes draft to active |
+| `BID_SUBMITTED` | Any carrier submits a bid |
+| `TIME_EXTENDED` | Extension condition met, end time pushed forward |
+| `EXTENSION_BLOCKED` | Extension would have fired but forced close already reached |
+| `CLOSED` | Cron closes auction at current_end_time |
+| `FORCE_CLOSED` | Cron closes auction at forced_end_time |
+
+### Indexes
+
+```sql
+CREATE INDEX idx_auctions_status ON auctions(status);
+CREATE INDEX idx_auctions_buyer  ON auctions(buyer_id);
+CREATE INDEX idx_bids_auction    ON bids(auction_id);
+CREATE INDEX idx_bids_carrier    ON bids(carrier_id);
+CREATE INDEX idx_logs_auction    ON auction_logs(auction_id);
+```
+
+The schema is auto-created on first `npm start`. No migration tool needed.
+
+---
+
+## 5. Auction Lifecycle
+
+```
+[draft] ──── cron: start_time reached ─────────▶ [active]
+                                                      │
+                    ┌─────────────────────────────────┤
+                    │                                 │
+     cron: current_end_time passed        cron: forced_end_time passed
+                    │                                 │
+                    ▼                                 ▼
+               [closed]                        [force_closed]
+```
+
+The cron job in `src/jobs/cronJobs.js` runs every **30 seconds** and checks:
+
+1. Any `draft` auction where `start_time <= now` → set status `active`, emit `auction_activated`
+2. Any `active` auction where `current_end_time <= now` AND `forced_end_time > now` → set `closed`, emit `auction_closed`
+3. Any `active` auction where `forced_end_time <= now` → set `force_closed`, emit `auction_closed`
+
+Each transition writes a log entry and emits socket events to relevant rooms.
+
+---
+
+## 6. British Auction — Extension Rules
+
+### Per-auction configuration
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `trigger_window` (X) | 5 min | The system monitors bids in the last X minutes before `current_end_time` |
+| `extension_duration` (Y) | 5 min | When triggered, `current_end_time` is pushed forward by Y minutes |
+
+### Gate check (runs first on every bid)
+
+```
+windowStart   = current_end_time − (X minutes)
+inWindow      = (now >= windowStart) AND (now <= current_end_time)
+```
+
+If `inWindow` is false, the function returns immediately with no extension.
+
+### The single extension rule
+
+> Extend if and only if: the bid is inside the trigger window AND the bidder
+> is at L1 in the current rankings after their bid is recorded.
+
+This one rule handles all four scenarios:
+
+| # | Scenario | Bidder at L1 after bid? | Extend? |
+|---|----------|------------------------|---------|
+| 1 | First ever bid on the auction | Yes — only bidder | Yes |
+| 2 | Bidder was L2 or lower, undercuts current L1 | Yes — new sole L1 | Yes |
+| 3 | Bidder was already sole L1, bids even lower | Yes — still sole L1 | Yes |
+| 4 | A and B tied at L1 (100), A bids 90 — B evicted | Yes — A now sole L1 | Yes |
+| 5 | A and B tied at L1 (100), C bids 100 — joins tie | Yes — C is now L1 too | Yes |
+| 6 | A is L1 (90), B bids 95 — still L2 | No | No |
+| 7 | A is L1 (90), C bids 92 — L3 | No | No |
+
+The only non-extend case: bidder's best amount after the bid is strictly
+greater than the current auction minimum. They are L2 or lower and their
+bid changed nothing about who holds L1.
+
+### Forced close guard
+
+```
+newEnd   = current_end_time + Y minutes
+finalEnd = min(newEnd, forced_end_time)
+
+if finalEnd > current_end_time  →  apply extension, log TIME_EXTENDED
+else                            →  log EXTENSION_BLOCKED (already at hard ceiling)
+```
+
+The auction can never exceed `forced_end_time`.
+
+### Rank tie-breaking
+
+When two or more carriers have the same `total_amount`, they share the same rank.
+The next distinct rank skips to reflect actual positions:
+
+```
+Carrier A  80    L1
+Carrier B  100   L2
+Carrier C  100   L2   (tie — same rank as B)
+Carrier D  150   L4   (L3 skipped, positions 3 and 4 were occupied by the L2 tie)
 ```
 
 ---
 
-## Cron Job
+## 7. API Reference
 
-Runs every minute via `node-cron` (`* * * * *`).
+All endpoints except auth require the header:
+```
+Authorization: Bearer <jwt_token>
+```
 
-**What it does:**
+### Auth
 
-1. Finds all `active` RFQs where `end_date <= now`
-2. For each expired RFQ:
-   - If `forced_end_date <= now` → mark as `force_closed`
-   - Otherwise → mark as `closed`
-3. Inserts a `status_change` log entry
-4. Broadcasts `rfq_updated` + `auction_ended` to the RFQ's Socket.io room
-5. Also finds all `draft` RFQs where `start_date <= now` and auto-activates them
+| Method | Endpoint | Body | Response |
+|--------|----------|------|----------|
+| POST | `/api/auth/signup` | `name, email, password, role` | `{ token, user }` |
+| POST | `/api/auth/signin` | `email, password` | `{ token, user }` |
 
-The cron runs independently of HTTP requests — even if no one is browsing the app, auctions will close on time.
+`role` must be `"buyer"` or `"carrier"`. Password minimum 6 characters.
+
+### Auctions
+
+| Method | Endpoint | Role | Description |
+|--------|----------|------|-------------|
+| POST | `/api/auctions` | buyer | Create a new auction |
+| GET | `/api/auctions/my` | buyer | List this buyer's auctions with bid counts |
+| GET | `/api/auctions/all` | any | List all active/closed auctions |
+| GET | `/api/auctions/:id` | any | Full detail: auction + ranked bids + all logs |
+
+**POST `/api/auctions` — request body:**
+```json
+{
+  "rfq_name":           "Kerala to Mumbai",
+  "start_time":         "2024-10-15T10:00:00",
+  "end_time":           "2024-10-15T12:00:00",
+  "forced_end_time":    "2024-10-15T13:00:00",
+  "pickup_date":        "2024-10-20",
+  "trigger_window":     5,
+  "extension_duration": 5
+}
+```
+
+**Validation enforced server-side:**
+- `start_time` must be in the future
+- `end_time > start_time`
+- `forced_end_time > end_time`
+- `trigger_window >= 1`
+- `extension_duration >= 1`
+
+### Bids
+
+| Method | Endpoint | Role | Description |
+|--------|----------|------|-------------|
+| POST | `/api/auctions/:auction_id/bid` | carrier | Submit a bid |
+
+**POST body:**
+```json
+{
+  "freight_charges":     15000,
+  "origin_charges":      2000,
+  "destination_charges": 1500,
+  "transit_time":        "3-4 days",
+  "quote_validity":      "2024-10-25"
+}
+```
+
+`total_amount` is computed server-side as `freight + origin + destination`.
+
+**Bid validation rules:**
+- Auction status must be `active`
+- `now <= current_end_time`
+- `total_amount > 0`
+- If carrier has bid before: new total must be strictly less than their existing best
 
 ---
 
-## Environment Variables
+## 8. Socket Events
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://postgres:password@localhost:5432/rfq_auction` |
-| `JWT_SECRET` | Secret key for signing JWTs | `rfq_auction_secret_key` ← **change this** |
-| `PORT` | Port for the Express server | `3001` |
-| `CLIENT_URL` | Frontend URL for CORS | `http://localhost:3000` |
+### Client sends to server
 
----
+| Event | Payload | When to call |
+|-------|---------|-------------|
+| `join_auction` | `auction_id` (number) | On mounting an auction detail page |
+| `leave_auction` | `auction_id` (number) | On unmounting an auction detail page |
 
-## Notes and Gotchas
+### Server sends to client
 
-**One bid per carrier per RFQ** — when a carrier places a new bid, the old one is set to `is_active = false` and a new row is inserted. This means the full bid history is preserved in the database even though only the latest active bid shows in the rankings.
-
-**Carrier anonymity** — on the RFQ detail page, carriers can only see their own name. Other carriers show as "Carrier 1", "Carrier 2" etc. Buyers can see all names.
-
-**Auth is cookie-based** — the JWT is stored in an `httpOnly` cookie, so JavaScript can't read it. This means `credentials: 'include'` is required on every fetch call from the frontend.
-
-**Socket auth** — the Socket.io connection also authenticates using the JWT from the cookie header. If the cookie is missing or invalid, the socket connection is rejected.
-
-**The trigger window check happens on the `rfq` object fetched before the bid write** — this is intentional. If the end_date gets extended between reading and writing, the check uses the end_date that was current when the bid came in. Extensions compound correctly because each bid re-reads the latest `end_date` from the database.
+| Event | Scope | Payload | Triggered by |
+|-------|-------|---------|-------------|
+| `bid_update` | auction room | `{ auction, ranked_bids, new_bid, extended, logs }` | Any new bid |
+| `auction_activated` | broadcast | `{ auction }` | Cron: draft to active |
+| `auction_closed` | auction room | `{ auction, status }` | Cron: any closure |
+| `auction_list_update` | broadcast | `{ auction }` | Any auction state change |
 
 ---
 
-## License
+## 9. Setup — Backend
 
-MIT
+### Prerequisites
+- Node.js >= 18
+- PostgreSQL >= 13 running locally or accessible remotely
+
+### Step 1 — Create the database
+```bash
+psql -U postgres
+CREATE DATABASE rfq_auction;
+\q
+```
+
+### Step 2 — Install dependencies
+```bash
+cd backend
+npm install
+```
+
+### Step 3 — Configure environment
+Edit `backend/.env`:
+```env
+PORT=5000
+DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/rfq_auction
+JWT_SECRET=replace_with_a_long_random_secret_string
+NODE_ENV=development
+```
+
+### Step 4 — Start the server
+```bash
+npm start
+```
+
+Expected output on first start:
+```
+✅ Database schema initialized
+✅ Cron jobs started (every 30s)
+🚀 RFQ Auction server running on port 5000
+```
+
+Tables are created automatically. No manual migration needed.
+
+### Optional — auto-restart on changes
+```bash
+npm install -g nodemon
+nodemon server.js
+```
+
+---
+
+## 10. Setup — Frontend
+
+### Prerequisites
+- Node.js >= 18
+
+### Step 1 — Install dependencies
+```bash
+cd frontend
+npm install
+```
+
+### Step 2 — Configure environment
+Edit `frontend/.env`:
+```env
+REACT_APP_API_URL=http://localhost:5000/api
+REACT_APP_SOCKET_URL=http://localhost:5000
+```
+
+### Step 3 — Start development server
+```bash
+npm start
+```
+
+Opens at http://localhost:3000
+
+### Step 4 — Production build
+```bash
+npm run build
+```
+
+Output goes to `frontend/build/`. Serve with Nginx, Apache, or any static host.
+
+---
+
+## 11. Environment Variables
+
+### Backend
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PORT` | No (default 5000) | HTTP server port |
+| `DATABASE_URL` | Yes | Full PostgreSQL connection string |
+| `JWT_SECRET` | Yes | Secret for signing JWTs. Use a long random value in production. |
+| `NODE_ENV` | No | Set to `production` to enable SSL on DB connection |
+
+### Frontend
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `REACT_APP_API_URL` | No (default localhost:5000/api) | Backend API base URL |
+| `REACT_APP_SOCKET_URL` | No (default localhost:5000) | Socket.IO server URL |
+
+---
+
+## 12. Roles and Permissions
+
+| Feature | Buyer | Carrier |
+|---------|-------|---------|
+| Sign up / Sign in | Yes | Yes |
+| Create auction | Yes | No |
+| View own auctions (with bid counts) | Yes | No |
+| View all active and closed auctions | No | Yes |
+| View full auction detail, rankings, logs | Yes | Yes |
+| Submit a bid | No | Yes |
+| Live updates via WebSocket | Yes | Yes |
+
+---
+
+## Quick Start (run both together)
+
+```bash
+# Terminal 1
+cd rfq-auction/backend
+npm install
+npm start
+
+# Terminal 2
+cd rfq-auction/frontend
+npm install
+npm start
+```
+
+Open http://localhost:3000, create a buyer account, create an auction with a
+start time a few minutes from now. Open a second browser tab, create a carrier
+account, wait for the auction to go active, and start bidding.
